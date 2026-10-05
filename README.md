@@ -76,6 +76,18 @@
   `pending`**。核对与写入在单个 `BEGIN IMMEDIATE` 事务内完成，并发回传串行化，序号与汇总一致。
   回执只增不改、与判定/策略/熔断完全解耦：既有判定查询、同编号重放内容、核对报表与灰度熔断
   统计均不受回执影响。
+- **投递任务领取（租约）**：投递系统用 `POST /delivery-tasks/claim` 给出**领取上限（1～100）与
+  租约秒数（1～3600）**，领取当前可执行的终点任务。**仅已持久化的成功判定**中的终点可入列：
+  **无回执立即到期**；最新回执为 `temporary_failure` 时，于该回执时间之后按
+  **`min(60×2^(尝试序号−1), 3600)` 秒**到期（60s、120s、240s…封顶 1 小时），下一尝试序号为
+  最新序号 +1；最新回执为 `delivered` / `permanent_failure` 的终点**不再入列**。服务按
+  **到期时间、投递编号、终点稳定排序**返回至多上限项，每项含**投递编号、终点、下一尝试序号、
+  到期时间与租约令牌**；暂无到期项返回空列表。并发领取在单个 `BEGIN IMMEDIATE` 事务内串行化，
+  同一终点的有效租约**绝不重复分配**；租约到期后该终点**可被重新领取，旧令牌立即失效**。
+  凭有效令牌调 `POST /delivery-tasks/complete` 提交既有三种回执结果之一时，**在同一事务内原子
+  写入回执（沿用回执表全部既有约定）并结束租约**；若既有回执接口已先记录了该终点的新回执，
+  **令牌失效且不得覆盖**。过期、未知或失效令牌明确返回 `409 lease_token_invalid`（附原因）；
+  参数非法（422）直接拒绝。领取与完成不影响既有回执接口及查询、判定重放、核对报表与熔断统计。
 
 ## 一键启动（Docker Compose）
 
@@ -136,6 +148,8 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | POST | `/deliveries/{id}/receipts` | 投递结果回执：按终点 + 正整数序号回传实际投递结果 |
 | GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
+| POST | `/delivery-tasks/claim`     | 领取到期终点任务：领取上限 + 租约秒数，返回到期项与租约令牌 |
+| POST | `/delivery-tasks/complete`  | 凭有效租约令牌原子提交回执并结束租约（失效令牌 409） |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
@@ -844,6 +858,109 @@ curl http://localhost:8000/deliveries/msg-2026-10-05-0001/receipts
   `GET /deliveries/{id}` 的判定内容、`POST /deliveries` 的同编号原样重放、
   `/deliveries/report` 报表（只统计判定）与灰度熔断的候选失败率统计（只数判定行）均完全不变。
 
+## 投递任务领取：租约式领取到期终点，凭令牌提交回执
+
+投递系统（worker）需要一批“现在就该尝试投递”的终点任务。`POST /delivery-tasks/claim` 按
+**领取上限 + 租约秒数**原子领取当前到期的成功判定终点，返回每项的投递编号、终点、下一尝试序号、
+到期时间与租约令牌；worker 完成实际投递后，凭令牌调 `POST /delivery-tasks/complete` 原子提交回执。
+
+### 19. 领取到期任务（POST /delivery-tasks/claim）
+
+请求体：
+
+- `max_claims`：本次领取上限，整数 `1～100`；
+- `lease_seconds`：租约有效秒数，整数 `1～3600`；越界 / 缺字段均 `422`，不产生任何租约。
+
+```bash
+curl -X POST http://localhost:8000/delivery-tasks/claim -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 300}'
+```
+
+**入列条件（仅已持久化的成功判定中的终点）**：
+
+- **无回执**：判定持久化后**立即到期**，`next_attempt_no` 为 `1`；
+- **最新回执为 `temporary_failure`**（尝试序号 k、回执时间 t）：在 t 之后
+  **`min(60×2^(k−1), 3600)` 秒**到期——第 1 次失败后 60 秒、第 2 次 120 秒、第 3 次 240 秒……
+  第 7 次起封顶 3600 秒；`next_attempt_no` 为 `k+1`；
+- **最新回执为 `delivered` / `permanent_failure`**：终结，**不再入列**；
+- 原判定失败（拒收 / 无路由 / 成环）的投递编号没有终点，从不入列。
+
+返回按**到期时间、投递编号、终点**稳定排序后的至多 `max_claims` 项；暂无到期项返回
+`{"tasks": []}`：
+
+```json
+{
+  "tasks": [
+    {"delivery_id": "msg-2026-10-05-0001", "endpoint": "alice@mail.example.com",
+     "next_attempt_no": 1, "due_at": "2026-10-05T03:10:00+00:00",
+     "lease_token": "4e3iTkjiXlTnK82-UmE9qyO3vYrJ8o4lMCDofeQOpcM",
+     "lease_expires_at": "2026-10-05T03:15:00+00:00"},
+    {"delivery_id": "msg-2026-10-05-0001", "endpoint": "bob@mail.example.com",
+     "next_attempt_no": 1, "due_at": "2026-10-05T03:10:00+00:00",
+     "lease_token": "pX9...（另一令牌）", "lease_expires_at": "2026-10-05T03:15:00+00:00"},
+    {"delivery_id": "msg-2026-10-05-0007", "endpoint": "carol@mail.example.com",
+     "next_attempt_no": 3, "due_at": "2026-10-05T03:11:24+00:00",
+     "lease_token": "Qa2...", "lease_expires_at": "2026-10-05T03:15:00+00:00"}
+  ]
+}
+```
+
+- 每个 `(投递编号, 终点)` 同时**至多一条有效（active）租约**：领取在单个
+  `BEGIN IMMEDIATE` 事务内先统一作废旧租约、再排序取项并写租约行，并发领取由写锁串行化、
+  由 active 部分唯一索引兜底，**绝不会把同一有效租约重复分配给两个调用方**。
+- 租约到期（`lease_expires_at`）后该终点可被**重新领取**：新领取产生新令牌，
+  **旧令牌立即失效**（即使没人重领，过期令牌的提交也会被拒绝）。
+- `due_at` 为该项的到期时刻（无回执即判定受理时刻；暂时失败即回执时间 + 退避秒数）；
+  `lease_expires_at` 为本次租约到期时刻（领取时刻 + `lease_seconds`）。
+
+### 20. 凭令牌提交回执（POST /delivery-tasks/complete）
+
+worker 实际投递后，用领取所得令牌提交本次尝试（即 `next_attempt_no`）的结果，
+结果仍是既有三种：`temporary_failure` / `permanent_failure` / `delivered`。
+
+```bash
+curl -X POST http://localhost:8000/delivery-tasks/complete -H 'Content-Type: application/json' \
+  -d '{"lease_token": "4e3iTkjiXlTnK82-UmE9qyO3vYrJ8o4lMCDofeQOpcM", "result": "delivered"}'
+```
+
+```json
+{"delivery_id": "msg-2026-10-05-0001", "mailbox": "alice@mail.example.com",
+ "attempt_no": 1, "result": "delivered", "created_at": "2026-10-05T03:12:00+00:00"}
+```
+
+- **原子完成**：在单个 `BEGIN IMMEDIATE` 事务内写入既有回执表（`delivery_attempts`，
+  与直接回执接口写入同一张表、同一条记录，序号 / 终结等全部既有约束一致）并把租约置为完成。
+- **既有回执接口抢先时令牌失效**：若 `POST /deliveries/{id}/receipts` 已先记录了该终点的新回执
+  （序号 ≥ 令牌对应序号），完成请求报 `409 {"error": "lease_token_invalid", "reason": "superseded"}`，
+  **不覆盖**抢先回执（租约保持未完成，worker 可在下一轮领取中按最新状态重新取得任务）。
+- **过期 / 失效令牌明确报冲突**：`409 {"error": "lease_token_invalid", "reason": ...}`，原因取值：
+
+  | reason | 含义 |
+  | ------ | ---- |
+  | `not_found` | 令牌不存在（拼错 / 伪造） |
+  | `expired` | 租约已到期并被作废（可能已被他人重新领取） |
+  | `superseded` | 终点的新回执已由既有回执接口先行写入，令牌作废 |
+  | `result_conflict` | 同一令牌已完成且结果不同（首次结果不改写） |
+  | `attempt_taken` | 并发兜底：该序号已被其他提交占用 |
+
+- **完成重试幂等**：同一令牌 + 同一结果的超时重发原样返回首次回执记录（含首次 `created_at`），
+  不新增回执；同一令牌提交不同结果得到 `result_conflict`。
+- 提交 `temporary_failure` 后该终点按上面的退避表在之后的领取中重新出现（序号 +1）；
+  提交 `delivered` / `permanent_failure` 后该终点不再入列。可用既有
+  `GET /deliveries/{id}/receipts` 查询经领取流程写入的尝试记录与汇总状态。
+- 请求体非法（空令牌、非法结果）返回 `422`。
+
+### 21. 领取流程与既有功能的边界
+
+- 领取只读取已持久化的成功判定与既有回执、写入独立的 `delivery_leases` 租约表；
+  完成时写入的回执与直接回执接口完全同构，因此既有回执查询与汇总、判定查询、同编号重放、
+  `/deliveries/report` 核对报表与灰度熔断统计的行为均保持不变（领取与租约不计数、不触发熔断）。
+- 直接回执接口与领取 / 完成可以混用：直接接口对某终点写入新回执后，该终点待提交的旧令牌立即
+  失效；终结结果之后该终点也不会再被领取。
+- 典型 worker 循环：`claim` → 对每项执行实际投递 → `complete`；`complete` 收到
+  `lease_token_invalid` 时丢弃本次结果（终点已由他人处理或已过期重领），下一轮 `claim`
+  自然会带回该终点的最新状态。
+
 ## 项目结构
 
 ```
@@ -854,9 +971,9 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/任务领取）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、到期任务领取租约、核对报表与灰度熔断的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/delivery-tasks/claim、/delivery-tasks/complete 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 到期任务领取租约 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```

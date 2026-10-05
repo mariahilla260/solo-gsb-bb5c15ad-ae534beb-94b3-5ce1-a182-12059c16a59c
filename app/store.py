@@ -1,7 +1,8 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、历史判定核对报表与灰度自动熔断。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、历史判定核对报表、灰度自动熔断与投递任务领取租约。"""
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -849,3 +850,203 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
     else:
         overall = "pending"
     return {"delivery_id": delivery_id, "status": overall, "endpoints": endpoints_out}
+
+
+# ---------- 投递任务领取：到期可重试终点 + 租约（领取原子、凭令牌提交回执、到期可重领） ----------
+#
+# 只有已持久化的“成功”判定中的终点可入列。每个 (投递编号, 终点) 的下一尝试到期时间：
+#   - 无任何回执：立即到期（按判定受理时刻即已到期）；
+#   - 最新回执为 temporary_failure（序号 k、回执时间 t）：t 之后
+#     min(60×2^(k−1), 3600) 秒到期，下一尝试序号为 k+1；
+#   - 最新回执为 delivered / permanent_failure：终结，不再入列。
+# 领取在单个 BEGIN IMMEDIATE 事务内完成：先把已过期的 active 租约置为 expired
+# （旧令牌立即失效），再按到期时间、投递编号、终点稳定排序取前 N 个“已到期且无
+# active 租约”的终点，为每个终点插入一条新 active 租约。部分唯一索引
+# idx_delivery_leases_active 兜底保证同一终点至多一条 active 租约，并发领取
+# 由写锁串行化，绝不重复分配。完成须凭有效令牌：原子写入既有回执
+# （delivery_attempts，沿用全部既有回执约束）并结束租约；若既有回执接口已先写入
+# 该终点的新回执，令牌立即失效且不得覆盖。令牌过期或已失效明确报冲突。
+
+
+def _parse_utc(value: str) -> datetime:
+    """解析库内 UTC ISO 时刻（created_at / expires_at 均带 +00:00 偏移）。"""
+    return datetime.fromisoformat(value)
+
+
+def _new_lease_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def expire_due_leases(conn: sqlite3.Connection, now: datetime) -> int:
+    """把已过期但仍 active 的租约置为 expired（旧令牌随之失效）。须在写事务内调用。"""
+    cur = conn.execute(
+        "UPDATE delivery_leases SET status = 'expired' WHERE status = 'active' AND expires_at <= ?",
+        (now.isoformat(timespec="seconds"),),
+    )
+    return cur.rowcount
+
+
+def list_due_tasks(conn: sqlite3.Connection, now: datetime) -> list[dict]:
+    """列出全部“已到期且无有效租约”的成功判定终点（不限数量，领取时再排序截断）。
+
+    到期规则：无回执立即到期；最新回执为 temporary_failure 时按
+    min(60×2^(尝试序号−1), 3600) 秒后到期；终结结果（delivered /
+    permanent_failure）不入列。SQL 只负责取每个终点的最新回执与是否存在
+    active 租约；退避与到期比较统一在 Python 完成（避免两套退避实现）。
+    """
+    rows = conn.execute(
+        """
+        SELECT d.delivery_id AS delivery_id,
+               json_extract(je.value, '$.mailbox') AS mailbox,
+               a.attempt_no AS last_attempt_no,
+               a.result AS last_result,
+               a.created_at AS last_attempt_at,
+               d.created_at AS decision_created_at,
+               EXISTS (
+                   SELECT 1 FROM delivery_leases AS l
+                   WHERE l.delivery_id = d.delivery_id
+                     AND l.mailbox = json_extract(je.value, '$.mailbox')
+                     AND l.status = 'active'
+               ) AS has_active
+        FROM delivery_decisions AS d
+        JOIN json_each(d.endpoints) AS je
+        LEFT JOIN delivery_attempts AS a
+          ON a.delivery_id = d.delivery_id
+         AND a.mailbox = json_extract(je.value, '$.mailbox')
+         AND a.attempt_no = (
+             SELECT MAX(x.attempt_no)
+             FROM delivery_attempts AS x
+             WHERE x.delivery_id = d.delivery_id
+               AND x.mailbox = json_extract(je.value, '$.mailbox')
+         )
+        WHERE d.status = 'ok'
+        """
+    ).fetchall()
+
+    tasks: list[dict] = []
+    for row in rows:
+        if row["has_active"]:  # 有效租约未结束：不重复入列（到期后由领取流程统一失效）
+            continue
+        if row["last_attempt_no"] is None:  # 无回执：立即到期，下一尝试为 1
+            tasks.append({
+                "delivery_id": row["delivery_id"],
+                "mailbox": row["mailbox"],
+                "next_attempt_no": 1,
+                "due_at": row["decision_created_at"],
+            })
+            continue
+        if row["last_result"] in TERMINAL_RESULTS:  # delivered / permanent_failure 不再入列
+            continue
+        # 最新回执为 temporary_failure：按其序号指数退避（封顶 3600 秒）
+        backoff = min(3600, 60 * (1 << (row["last_attempt_no"] - 1)))
+        due = _parse_utc(row["last_attempt_at"]) + timedelta(seconds=backoff)
+        if due <= now:
+            tasks.append({
+                "delivery_id": row["delivery_id"],
+                "mailbox": row["mailbox"],
+                "next_attempt_no": row["last_attempt_no"] + 1,
+                "due_at": due.isoformat(timespec="seconds"),
+            })
+    return tasks
+
+
+def claim_tasks(conn: sqlite3.Connection, max_claims: int, lease_seconds: int) -> list[dict]:
+    """领取至多 max_claims 个到期终点任务并各发一条租约。须在 BEGIN IMMEDIATE 事务内调用。
+
+    按到期时间、投递编号、终点稳定排序；返回每项含投递编号、终点、下一尝试序号、
+    到期时间与租约令牌。并发领取由写锁串行化 + active 部分唯一索引兜底，
+    同一有效租约绝不会被重复分配。
+    """
+    now = datetime.now(timezone.utc)
+    expire_due_leases(conn, now)
+    due = list_due_tasks(conn, now)
+    due.sort(key=lambda t: (t["due_at"], t["delivery_id"], t["mailbox"]))
+    chosen = due[:max_claims]
+    if not chosen:
+        return []
+
+    now_iso = now.isoformat(timespec="seconds")
+    expires = (now + timedelta(seconds=lease_seconds)).isoformat(timespec="seconds")
+    claimed: list[dict] = []
+    for task in chosen:
+        token = _new_lease_token()
+        conn.execute(
+            """
+            INSERT INTO delivery_leases (
+                delivery_id, mailbox, attempt_no, lease_token, status,
+                expires_at, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL)
+            """,
+            (task["delivery_id"], task["mailbox"], task["next_attempt_no"], token, expires, now_iso),
+        )
+        claimed.append({**task, "lease_token": token, "lease_expires_at": expires})
+    return claimed
+
+
+class LeaseTokenInvalid(Exception):
+    """提交回执所用的租约令牌无效：不存在、已完成、已过期，或终点已被既有回执抢先更新。"""
+
+    def __init__(self, reason: str):
+        super().__init__(f"lease token invalid: {reason}")
+        self.reason = reason
+
+
+def get_lease_by_token(conn: sqlite3.Connection, token: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id, delivery_id, mailbox, attempt_no, lease_token, status, "
+        "expires_at, created_at, completed_at FROM delivery_leases WHERE lease_token = ?",
+        (token,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def complete_leased_task(conn: sqlite3.Connection, token: str, result: str) -> dict:
+    """凭有效租约令牌原子写入回执并结束租约。须在 BEGIN IMMEDIATE 写事务内调用。
+
+    - 先把已过期的 active 租约统一置为 expired：过期令牌、未知令牌、已结束的旧令牌
+      均抛 LeaseTokenInvalid（reason: expired / not_found / completed / superseded），明确冲突；
+    - 既有回执接口已先记录该终点的新回执（任何序号的新记录，或该序号已被他人写入）时，
+      令牌失效、租约保持 active 未完成且不得覆盖（superseded / attempt_taken）；
+    - 同一令牌同一结果的完成重试（租约已 completed）原样返回首次记录（幂等重放）；
+    - 同一令牌不同结果的重试报冲突（result_conflict），首次记录不改写。
+    回执与直接回传接口写入同一张 delivery_attempts，沿用其全部序号 / 终结约束。
+    """
+    now = datetime.now(timezone.utc)
+    expire_due_leases(conn, now)
+
+    lease = get_lease_by_token(conn, token)
+    if lease is None:
+        raise LeaseTokenInvalid("not_found")
+    if lease["status"] == "expired":
+        raise LeaseTokenInvalid("expired")
+
+    if lease["status"] == "completed":  # 同令牌完成重试：按既有回执做幂等 / 冲突判定
+        existing = get_attempt(conn, lease["delivery_id"], lease["mailbox"], lease["attempt_no"])
+        if existing is not None and existing["result"] == result:
+            return {"delivery_id": lease["delivery_id"], "mailbox": lease["mailbox"], **existing}
+        raise LeaseTokenInvalid(
+            "result_conflict" if existing is not None else "superseded"
+        )
+
+    # 令牌仍 active：终点的新回执若已由既有回执接口先行写入，令牌立即失效且不得覆盖
+    last = get_last_attempt(conn, lease["delivery_id"], lease["mailbox"])
+    if last is not None and last["attempt_no"] >= lease["attempt_no"]:
+        raise LeaseTokenInvalid("superseded")
+
+    created_at = now.isoformat(timespec="seconds")
+    try:
+        conn.execute(
+            """
+            INSERT INTO delivery_attempts (delivery_id, mailbox, attempt_no, result, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (lease["delivery_id"], lease["mailbox"], lease["attempt_no"], result, created_at),
+        )
+    except sqlite3.IntegrityError:  # 并发兜底：序号已被直接回执或其他提交占用
+        raise LeaseTokenInvalid("attempt_taken")
+    conn.execute(
+        "UPDATE delivery_leases SET status = 'completed', completed_at = ? WHERE id = ?",
+        (created_at, lease["id"]),
+    )
+    stored = get_attempt(conn, lease["delivery_id"], lease["mailbox"], lease["attempt_no"])
+    return {"delivery_id": lease["delivery_id"], "mailbox": lease["mailbox"], **stored}

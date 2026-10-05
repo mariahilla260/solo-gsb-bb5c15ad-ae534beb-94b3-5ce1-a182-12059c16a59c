@@ -106,6 +106,20 @@ class DeliveryReceiptIn(BaseModel):
     result: Literal["temporary_failure", "permanent_failure", "delivered"]
 
 
+class DeliveryTaskClaim(BaseModel):
+    """投递系统领取可执行终点任务：单次领取上限与租约秒数。"""
+
+    max_claims: int = Field(ge=1, le=100, description="本次领取上限（1～100）")
+    lease_seconds: int = Field(ge=1, le=3600, description="租约有效秒数（1～3600）")
+
+
+class DeliveryTaskComplete(BaseModel):
+    """凭领取所得的有效租约令牌提交本次尝试的回执结果（三种既有结果）。"""
+
+    lease_token: str = Field(min_length=1, description="领取接口返回的租约令牌")
+    result: Literal["temporary_failure", "permanent_failure", "delivered"]
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

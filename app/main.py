@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期终点 + 租约，凭令牌提交回执）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -13,6 +13,8 @@ from .models import (
     DeliveryBatchSubmit,
     DeliveryReceiptIn,
     DeliverySubmit,
+    DeliveryTaskClaim,
+    DeliveryTaskComplete,
     DraftChangesRequest,
     DraftUpdate,
     PolicyUpdate,
@@ -834,3 +836,68 @@ def get_delivery_receipts(delivery_id: str) -> dict:
             detail={"error": "delivery_not_found", "delivery_id": delivery_id},
         )
     return summary
+
+
+# ---------- 投递任务领取：领取到期终点（租约）并凭令牌提交回执 ----------
+
+def _claimed_task_doc(task: dict) -> dict:
+    """领取结果：投递编号、终点、下一尝试序号、到期时间与租约令牌（附租约到期时刻）。"""
+    return {
+        "delivery_id": task["delivery_id"],
+        "endpoint": task["mailbox"],
+        "next_attempt_no": task["next_attempt_no"],
+        "due_at": task["due_at"],
+        "lease_token": task["lease_token"],
+        "lease_expires_at": task["lease_expires_at"],
+    }
+
+
+@app.post("/delivery-tasks/claim")
+def claim_delivery_tasks(body: DeliveryTaskClaim) -> dict:
+    """投递系统领取当前可执行的终点任务。
+
+    仅已持久化的**成功判定**中的终点可入列：无回执立即到期；最新回执为
+    temporary_failure 时于该回执时间后按 min(60×2^(尝试序号−1), 3600) 秒到期；
+    最新回执为 delivered / permanent_failure 的终点不再入列。
+    服务按**到期时间、投递编号、终点稳定排序**，至多返回 max_claims（1～100）项，
+    每项给出投递编号、终点、下一尝试序号、到期时间与租约令牌；暂无到期项返回空列表。
+    每个终点同时至多持有一条有效租约（并发领取在 BEGIN IMMEDIATE 事务内串行化，
+    绝不重复分配）；租约到期（lease_seconds，1～3600）后该终点可被重新领取，
+    旧令牌随之失效。非法参数由请求体校验拒绝（422）。
+    """
+    try:
+        with db.transaction() as conn:
+            tasks = store.claim_tasks(conn, body.max_claims, body.lease_seconds)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"tasks": [_claimed_task_doc(t) for t in tasks]}
+
+
+@app.post("/delivery-tasks/complete")
+def complete_delivery_task(body: DeliveryTaskComplete) -> dict:
+    """凭领取所得的有效租约令牌提交本次尝试的回执（既有三种结果之一）。
+
+    核对 + 写入在单个 BEGIN IMMEDIATE 事务内原子完成：写入既有回执记录
+    （delivery_attempts，沿用按终点递增序号与终结封口等全部既有约定）并结束租约。
+    若既有回执接口已先记录了该终点的新回执，令牌立即失效且不得覆盖；
+    过期、未知或已失效的令牌一律明确报冲突：
+    `409 {"error": "lease_token_invalid", "reason": "expired"|"not_found"|"superseded"|
+    "result_conflict"|"attempt_taken"}`。
+    同一令牌同一结果的完成重试（超时重发）原样返回首次回执记录（幂等）；
+    同令牌不同结果的重试报 result_conflict，首次记录不改写。
+    回执写入后该终点按既有到期规则参与后续领取（temporary_failure 退避后重领，
+    delivered / permanent_failure 不再入列）；判定查询、判定重放、核对报表与
+    灰度熔断统计均不受影响。
+    """
+    try:
+        with db.transaction() as conn:
+            attempt = store.complete_leased_task(conn, body.lease_token, body.result)
+    except store.LeaseTokenInvalid as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "lease_token_invalid", "reason": exc.reason,
+                    "message": str(exc)},
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return attempt

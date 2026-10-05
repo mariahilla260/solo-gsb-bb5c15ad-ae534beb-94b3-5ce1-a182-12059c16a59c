@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执与灰度熔断、投递任务领取租约。"""
 from __future__ import annotations
 
 import os
@@ -109,13 +109,36 @@ CREATE TABLE IF NOT EXISTS circuit_breaks (
 -- 新序号必须大于该终点已记录的最大序号；已送达 / 永久失败为终结结果，之后不得再收新尝试。
 -- 回执与判定、策略、熔断统计完全解耦：写入回执不影响判定重放、核对报表与灰度熔断。
 CREATE TABLE IF NOT EXISTS delivery_attempts (
-    delivery_id TEXT NOT NULL REFERENCES delivery_decisions (delivery_id),
+    delivery_id TEXT NOT NULL REFERENCES delivery_decisions (delivery_id) ON DELETE CASCADE,
     mailbox     TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
     attempt_no  INTEGER NOT NULL CHECK (attempt_no >= 1),   -- 正整数尝试序号
     result      TEXT NOT NULL CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
     created_at  TEXT NOT NULL,
     PRIMARY KEY (delivery_id, mailbox, attempt_no)
 );
+
+-- 投递任务租约：投递系统按“领取上限 + 租约秒数”领取当前到期、可重试的判定终点。
+-- 每行是一次领取（令牌唯一）：active 为有效租约，completed 已凭令牌提交回执结束，
+-- expired 为到期未完成（领取新一轮时把已过期的 active 行批量置为 expired，旧令牌随之失效）。
+-- 部分唯一索引保证同一 (投递编号, 终点) 至多一条 active 租约，并发领取不会重复分配。
+-- 到期时间不入库：无回执立即到期；最新回执为 temporary_failure 时按
+-- min(60×2^(attempt_no−1), 3600) 秒由该回执的 created_at 现算；delivered /
+-- permanent_failure 为终结结果，不再入列。
+CREATE TABLE IF NOT EXISTS delivery_leases (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id  TEXT NOT NULL REFERENCES delivery_decisions (delivery_id) ON DELETE CASCADE,
+    mailbox      TEXT NOT NULL,                    -- 领取的判定终点邮箱
+    attempt_no   INTEGER NOT NULL CHECK (attempt_no >= 1),   -- 本次领取对应的下一尝试序号
+    lease_token  TEXT NOT NULL UNIQUE,             -- 租约令牌（完成 / 失效判定的唯一凭据）
+    status       TEXT NOT NULL CHECK (status IN ('active', 'completed', 'expired')),
+    expires_at   TEXT NOT NULL,                    -- 租约到期时刻（UTC ISO 秒精度）
+    created_at   TEXT NOT NULL,                    -- 领取时刻
+    completed_at TEXT                              -- 凭令牌完成时刻；过期行保持 NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_leases_active
+ON delivery_leases (delivery_id, mailbox)
+WHERE status = 'active';
 """
 
 
