@@ -1,0 +1,14 @@
+services:
+  router:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      ROUTER_DB: /data/router.db
+      ROUTER_PORT: "8000"
+    volumes:
+      - router-data:/data
+    restart: unless-stopped
+
+volumes:
+  router-data:
