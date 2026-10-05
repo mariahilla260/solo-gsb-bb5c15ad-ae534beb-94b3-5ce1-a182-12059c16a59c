@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期 / 退避入列 + 租约，凭令牌原子回执）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -15,10 +15,12 @@ from .models import (
     DeliverySubmit,
     DraftChangesRequest,
     DraftUpdate,
+    LeaseCompleteIn,
     PolicyUpdate,
     PreviewRequest,
     PublishRequest,
     ResolveRequest,
+    TaskClaimIn,
     ValidationFailure,
     normalize_changes,
     normalize_rules,
@@ -834,3 +836,62 @@ def get_delivery_receipts(delivery_id: str) -> dict:
             detail={"error": "delivery_not_found", "delivery_id": delivery_id},
         )
     return summary
+
+
+# ---------- 投递任务领取（可执行终点入列 + 租约；凭令牌原子回执并结束租约） ----------
+
+
+@app.post("/deliveries/claims")
+def claim_delivery_tasks(body: TaskClaimIn) -> dict:
+    """投递系统领取可执行的终点投递任务。
+
+    调用方给出领取上限（1～100）与租约秒数（1～3600）；服务把所有已持久化的
+    成功判定中“已到期且无有效租约”的终点按到期时刻、投递编号、终点稳定排序，
+    返回至多 max_claims 项：投递编号、终点、下一尝试序号、到期时刻、租约到期
+    时刻与租约令牌。入列规则：无回执立即到期；最新回执为 temporary_failure 时
+    于该回执时间后按 min(60×2^(尝试序号−1), 3600) 秒到期；最新回执为
+    delivered / permanent_failure 不再入列。
+
+    核对与领取在单个 BEGIN IMMEDIATE 事务内完成：并发领取不会重复分配有效
+    租约；到期终点可被重新领取，重领即轮换令牌（旧令牌立即失效）。
+    暂无到期项返回空列表（200）；参数越界由请求体校验拒绝（422）。
+    """
+    try:
+        with db.transaction() as conn:
+            tasks = store.claim_due_tasks(conn, body.max_claims, body.lease_seconds)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"tasks": tasks}
+
+
+@app.post("/deliveries/claims/{token}/complete")
+def complete_delivery_claim(token: str, body: LeaseCompleteIn) -> dict:
+    """凭有效租约令牌提交既有三种回执结果之一，原子写入回执并结束租约。
+
+    尝试序号取租约记录的下一尝试序号，回执写入与租约结束在单个 BEGIN
+    IMMEDIATE 事务内原子完成。若既有回执接口（POST /deliveries/{id}/receipts）
+    已先为该终点记录了不早于租约序号的新回执，令牌失效且不得覆盖。
+    过期、已结束或未知令牌明确报冲突（409 invalid_lease_token，附 reason：
+    expired / completed / superseded / unknown）。
+    """
+    try:
+        with db.transaction() as conn:
+            attempt = store.complete_lease(conn, token, body.result)
+    except store.InvalidLeaseToken as exc:
+        messages = {
+            "expired": "lease has expired; the endpoint may have been re-claimed",
+            "completed": "this lease token was already used to submit a receipt",
+            "superseded": "a newer receipt for this endpoint was recorded first; the lease is stale and must not overwrite it",
+            "unknown": "unknown lease token",
+        }
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "invalid_lease_token",
+                "reason": exc.reason,
+                "message": messages[exc.reason],
+            },
+        )
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return attempt

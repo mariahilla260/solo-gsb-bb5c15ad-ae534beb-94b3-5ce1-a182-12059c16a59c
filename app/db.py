@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -115,6 +115,26 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     result      TEXT NOT NULL CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
     created_at  TEXT NOT NULL,
     PRIMARY KEY (delivery_id, mailbox, attempt_no)
+);
+
+-- 投递任务租约：投递系统按 (投递编号, 终点) 领取可执行的投递任务。
+-- 仅已持久化的“成功”判定中的终点可入列：无回执立即到期；最新回执为 temporary_failure
+-- 时按 min(60×2^(尝试序号−1), 3600) 秒退避到期；最新回执为 delivered / permanent_failure
+-- 不再入列。每个 (delivery_id, mailbox) 至多一行：领取时插入，到期重领时整体轮换
+-- （新令牌、新序号，completed_at/result 复位），旧令牌立即失效；凭有效令牌提交回执时
+-- 原子写入 delivery_attempts 并把 completed_at 置位（结束租约）。
+-- 有效租约 = completed_at IS NULL 且 lease_expires_at > 当前时刻；并发领取经
+-- BEGIN IMMEDIATE 串行化，同一终点的有效租约不会被重复分配。
+CREATE TABLE IF NOT EXISTS endpoint_leases (
+    token            TEXT PRIMARY KEY,              -- 租约令牌（随机生成；重领时轮换使旧令牌失效）
+    delivery_id      TEXT NOT NULL REFERENCES delivery_decisions (delivery_id) ON DELETE CASCADE,
+    mailbox          TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
+    attempt_no       INTEGER NOT NULL CHECK (attempt_no >= 1),   -- 本次领取的下一尝试序号
+    leased_at        TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,                   -- 租约到期时刻（到期后可被重新领取）
+    completed_at     TEXT,                            -- 凭有效令牌提交回执的时刻；NULL=未结束
+    result           TEXT CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
+    UNIQUE (delivery_id, mailbox)
 );
 """
 

@@ -1,7 +1,8 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、历史判定核对报表与灰度自动熔断。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、投递任务租约（到期 / 退避入列、领取与令牌回执）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -849,3 +850,204 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
     else:
         overall = "pending"
     return {"delivery_id": delivery_id, "status": overall, "endpoints": endpoints_out}
+
+
+# ---------- 投递任务领取（可执行终点入列 + 租约） ----------
+#
+# 入列条件（仅已持久化的成功判定中的终点）：
+# - 无任何回执：到期时刻 = 判定受理时刻（立即到期），下一尝试序号 = 1；
+# - 最新（序号最大）回执为 temporary_failure：到期时刻 = 该回执时刻 +
+#   min(60×2^(尝试序号−1), 3600) 秒，下一尝试序号 = 该回执序号 + 1；
+# - 最新回执为 delivered / permanent_failure：终结，永不入列。
+# 每个 (投递编号, 终点) 至多一行租约：未结束且未到期的租约为“有效租约”，
+# 不参与领取；领取（含到期重领）整体轮换该行——新令牌、新序号、新到期时刻，
+# completed_at/result 复位——因此旧令牌立即失效。凭有效令牌提交既有三种回执
+# 结果时，在同一事务内原子写入 delivery_attempts 并结束租约；若既有回执接口
+# 先为该终点记录了 attempt_no >= 租约序号的新回执（按序号规则必然是更晚的
+# 尝试），令牌失效且不得覆盖。全部“核对 + 写入”在单个 BEGIN IMMEDIATE
+# 事务内完成，并发领取串行化，同一终点的有效租约不会被重复分配。
+
+
+def backoff_delay_seconds(attempt_no: int) -> int:
+    """temporary_failure 后下一尝试的退避秒数：min(60×2^(尝试序号−1), 3600)。"""
+    return min(60 * (2 ** (attempt_no - 1)), 3600)
+
+
+def _parse_utc(value: str) -> datetime:
+    """解析库中 UTC ISO 8601 秒精度时刻为带时区 datetime。"""
+    return datetime.fromisoformat(value)
+
+
+class InvalidLeaseToken(Exception):
+    """租约令牌过期或失效：未知令牌 / 租约已到期 / 已结束 / 已被更新回执抢先。
+
+    reason 取值：unknown（令牌不存在）、expired（租约已到期，终点可被重领）、
+    completed（该令牌已用于提交回执）、superseded（已先记录不早于本租约序号的
+    新回执，令牌失效且不得覆盖）。
+    """
+
+    def __init__(self, reason: str, token: str):
+        super().__init__(f"invalid lease token ({reason})")
+        self.reason = reason
+        self.token = token
+
+
+def claim_due_tasks(
+    conn: sqlite3.Connection, max_claims: int, lease_seconds: int, *, now: datetime | None = None
+) -> list[dict]:
+    """领取至多 max_claims 个已到期的可投递终点，并为每个写入一条有效租约。
+
+    须在 BEGIN IMMEDIATE 写事务内调用：并发领取串行化，同一终点的有效租约
+    不会被重复分配。按到期时刻、投递编号、终点稳定排序后取前 max_claims 个，
+    每项返回投递编号、终点、下一尝试序号、到期时刻、租约到期时刻与租约令牌。
+    暂无到期项返回空列表。
+    """
+    current = now or datetime.now(timezone.utc)
+    now_text = current.isoformat(timespec="seconds")
+
+    # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
+    # 已有有效租约（未结束且未到期）的终点直接排除。退避到期在 Python 侧计算。
+    rows = conn.execute(
+        """
+        SELECT d.delivery_id,
+               json_extract(je.value, '$.mailbox') AS mailbox,
+               d.created_at AS decision_created_at,
+               a.attempt_no AS last_attempt_no,
+               a.result AS last_result,
+               a.created_at AS last_attempt_at
+        FROM delivery_decisions d, json_each(d.endpoints) AS je
+        LEFT JOIN delivery_attempts a
+               ON a.delivery_id = d.delivery_id
+              AND a.mailbox = json_extract(je.value, '$.mailbox')
+              AND a.attempt_no = (
+                    SELECT MAX(da.attempt_no)
+                    FROM delivery_attempts da
+                    WHERE da.delivery_id = d.delivery_id
+                      AND da.mailbox = json_extract(je.value, '$.mailbox')
+                )
+        WHERE d.status = 'ok'
+          AND NOT EXISTS (
+                SELECT 1 FROM endpoint_leases l
+                WHERE l.delivery_id = d.delivery_id
+                  AND l.mailbox = json_extract(je.value, '$.mailbox')
+                  AND l.completed_at IS NULL AND l.lease_expires_at > ?
+          )
+        ORDER BY d.delivery_id, json_extract(je.value, '$.mailbox')
+        """,
+        (now_text,),
+    ).fetchall()
+
+    candidates: list[tuple[datetime, str, str, int]] = []  # (到期时刻, 投递编号, 终点, 下一序号)
+    for row in rows:
+        if row["last_result"] is None:  # 无回执：立即到期
+            due_at = _parse_utc(row["decision_created_at"])
+            next_attempt_no = 1
+        elif row["last_result"] == "temporary_failure":  # 退避到期
+            due_at = _parse_utc(row["last_attempt_at"]) + timedelta(
+                seconds=backoff_delay_seconds(row["last_attempt_no"])
+            )
+            next_attempt_no = row["last_attempt_no"] + 1
+        else:  # delivered / permanent_failure：终结，不再入列
+            continue
+        if due_at <= current:
+            candidates.append((due_at, row["delivery_id"], row["mailbox"], next_attempt_no))
+
+    # 到期时刻 → 投递编号 → 终点，稳定排序
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    lease_expires_at = current + timedelta(seconds=lease_seconds)
+    leased_at_text = now_text
+    expires_text = lease_expires_at.isoformat(timespec="seconds")
+
+    tasks: list[dict] = []
+    for due_at, delivery_id, mailbox, next_attempt_no in candidates[:max_claims]:
+        token = secrets.token_hex(16)
+        # 每个 (投递编号, 终点) 至多一行：到期重领 / 已结束终点再次到期时整体轮换
+        # 该行——新令牌、新到期时刻并复位完成标记，旧令牌立即失效。attempt_no 取
+        # 本次按“最新回执”重算的下一序号：未结束且无外部新回执的到期重领与原序号
+        # 相同（同一尝试再发一次）；既有回执接口已抢先写入时随最新回执推进。
+        conn.execute(
+            """
+            INSERT INTO endpoint_leases (
+                token, delivery_id, mailbox, attempt_no,
+                leased_at, lease_expires_at, completed_at, result
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            ON CONFLICT(delivery_id, mailbox) DO UPDATE SET
+                token = excluded.token,
+                attempt_no = excluded.attempt_no,
+                leased_at = excluded.leased_at,
+                lease_expires_at = excluded.lease_expires_at,
+                completed_at = NULL,
+                result = NULL
+            """,
+            (token, delivery_id, mailbox, next_attempt_no, leased_at_text, expires_text),
+        )
+        tasks.append(
+            {
+                "delivery_id": delivery_id,
+                "mailbox": mailbox,
+                "attempt_no": next_attempt_no,
+                "due_at": due_at.isoformat(timespec="seconds"),
+                "lease_expires_at": expires_text,
+                "token": token,
+            }
+        )
+    return tasks
+
+
+def complete_lease(
+    conn: sqlite3.Connection,
+    token: str,
+    result: str,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """凭有效租约令牌原子写入一次回执并结束租约。须在 BEGIN IMMEDIATE 事务内调用。
+
+    返回与既有回执接口相同形状的尝试记录（delivery_id / mailbox / attempt_no /
+    result / created_at）。令牌未知、已到期、已结束 → InvalidLeaseToken
+    （unknown / expired / completed）；若既有回执接口先为该终点记录了
+    attempt_no >= 租约序号的新回执 → InvalidLeaseToken（superseded），令牌失效
+    且不得覆盖。校验通过则原子写入 delivery_attempts（结果只增不改的既有约定
+    不变）并把租约标记为已结束。
+    """
+    lease = conn.execute(
+        "SELECT token, delivery_id, mailbox, attempt_no, leased_at, lease_expires_at, "
+        "completed_at, result FROM endpoint_leases WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if lease is None:
+        raise InvalidLeaseToken("unknown", token)
+    if lease["completed_at"] is not None:
+        raise InvalidLeaseToken("completed", token)
+    current = now or datetime.now(timezone.utc)
+    if lease["lease_expires_at"] <= current.isoformat(timespec="seconds"):
+        raise InvalidLeaseToken("expired", token)
+
+    last = get_last_attempt(conn, lease["delivery_id"], lease["mailbox"])
+    if last is not None and last["attempt_no"] >= lease["attempt_no"]:
+        # 既有回执接口（或本终点的更晚租约）已先记录不早于本租约序号的新回执：
+        # 令牌失效，绝不覆盖。
+        raise InvalidLeaseToken("superseded", token)
+
+    # record_attempt 的全部既有约束（序号递增、终结封口、同序号一致性）在此同样
+    # 成立：上面的 superseded 核对已排除重叠序号，下面的写入与租约结束同事务原子提交。
+    created_at = current.isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO delivery_attempts (delivery_id, mailbox, attempt_no, result, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (lease["delivery_id"], lease["mailbox"], lease["attempt_no"], result, created_at),
+    )
+    conn.execute(
+        "UPDATE endpoint_leases SET completed_at = ?, result = ? WHERE token = ?",
+        (created_at, result, token),
+    )
+    return {
+        "delivery_id": lease["delivery_id"],
+        "mailbox": lease["mailbox"],
+        "attempt_no": lease["attempt_no"],
+        "result": result,
+        "created_at": created_at,
+    }
